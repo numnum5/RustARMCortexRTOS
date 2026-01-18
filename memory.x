@@ -16,6 +16,8 @@ _stack_start = ORIGIN(RAM) + LENGTH(RAM); /* 0x2000_0000 + 64K = 0x2001_0000 */
 _stack_size  = 0x00001000;                /* 4 KiB stack */
 _stack_end   = _stack_start - _stack_size;/* 0x2000_F000 */
 
+
+
 /* ─────────────────────────────────────────────
    Heap layout (fixed size, grows up)
    ───────────────────────────────────────────── */

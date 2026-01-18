@@ -1,523 +1,229 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::singleton;
-// pick a panicking behavior
-use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics
-// use panic_abort as _; // requires nightly
-// use panic_itm as _; // logs messages over ITM; requires ITM support
-// use panic_semihosting as _; // logs messages to the host stderr; requires a debugger
-
+use panic_halt as _; 
+extern crate alloc;
 use cortex_m_rt::entry;
 use cortex_m_semihosting::{debug, hprintln};
 use core::alloc::{GlobalAlloc, Layout};
-use core::f32::consts::PI;
-use core::ptr;
 use core::mem;
 use core::arch::{naked_asm, asm};
-use alloc::alloc::{alloc, dealloc};
+use cortex_m_rt::exception;
+use core::mem::MaybeUninit;
+
+
+pub mod kernel;
+use kernel::scheduler::Scheduler;
+use kernel::allocator::LinkedListAllocator;
+use kernel::allocator::Locked;
+use kernel::thread::Tcb;
+use kernel::thread::{StackFrameExtension, StackFrame};
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TaskContext {
-    // Software-saved (PendSV)
-    pub r4:  u32,
-    pub r5:  u32,
-    pub r6:  u32,
-    pub r7:  u32,
-    pub r8:  u32,
-    pub r9:  u32,
-    pub r10: u32,
-    pub r11: u32,
-
-    // Hardware-saved (exception entry)
-    pub r0:   u32,
-    pub r1:   u32,
-    pub r2:   u32,
-    pub r3:   u32,
-    pub r12:  u32,
-    pub lr:   u32,
-    pub pc:   u32,
-    pub xpsr: u32,
-}
-
-pub struct Locked<A> {
-    inner: spin::Mutex<A>,
-}
-
-impl<A> Locked<A> {
-    pub const fn new(inner: A) -> Self {
-        Locked {
-            inner: spin::Mutex::new(inner),
-        }
-    }
-
-    pub fn lock(&self) -> spin::MutexGuard<A> {
-        self.inner.lock()
-    }
-}
-
-
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
-}
-
-
-
-struct ListNode {
+pub struct Stack {
+    /// Pointer to the lowest address of the stack
+    bottom: *mut u8,
+    /// Stack size
     size: usize,
-    next: Option<&'static mut ListNode>,
-}
-impl ListNode {
-    const fn new(size: usize) -> Self {
-        ListNode { size, next: None }
-    }
-
-    fn start_addr(&self) -> usize {
-        self as *const Self as usize
-    }
-
-    fn end_addr(&self) -> usize {
-        self.start_addr() + self.size
-    }
+    /// Current stack pointer
+    ptr: *mut usize,
 }
 
 
-#[no_mangle]
-pub static mut pxCurrentTCB: *mut Tcb = core::ptr::null_mut();
-pub struct LinkedListAllocator {
-    head: ListNode,
-}
-
-#[repr(C)]
-pub struct Tcb {
-    // First field MUST be the saved stack pointer (like FreeRTOS)
-    pub top_of_stack: *mut u32,
-    // ... other fields (priority, list nodes, etc.)
-}
 
 
-impl LinkedListAllocator {
-    /// Creates an empty LinkedListAllocator.
-    pub const fn new() -> Self {
-        Self {
-            head: ListNode::new(0),
-        }
-    }
-
-    /// Initialize the allocator with the given heap bounds.
-    ///
-    /// This function is unsafe because the caller must guarantee that the given
-    /// heap bounds are valid and that the heap is unused. This method must be
-    /// called only once.
-    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
-        unsafe {
-            self.add_free_region(heap_start, heap_size);
-        }
-    }
-
-    /// Adds the given memory region to the front of the list.
-    unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-        // ensure that the freed region is capable of holding ListNode
-        let aligned_address = align_up(addr, mem::align_of::<ListNode>());
-        if size >= mem::size_of::<ListNode>()
-        {
-            // create a new list node and append it at the start of the list
-            let mut node = ListNode::new(size);
-
-            node.next = self.head.next.take();
-
-            let node_ptr = aligned_address as *mut ListNode;
-
-            unsafe {
-                node_ptr.write(node);
-                self.head.next = Some(&mut *node_ptr);
-            }
-        }
-
-    }
-
-    fn find_region(&mut self, size: usize, align: usize)
-        -> Option<(&'static mut ListNode, usize)>
-    {
-        // reference to current list node, updated for each iteration
-        let mut current = &mut self.head;
-        // look for a large enough memory region in linked list
-        while let Some(ref mut region) = current.next {
-            if let Ok(alloc_start) = Self::alloc_from_region(&region, size, align) {
-                // region suitable for allocation -> remove node from list
-                let next = region.next.take();
-                let ret = Some((current.next.take().unwrap(), alloc_start));
-                current.next = next;
-                return ret;
-            } else {
-                // region not suitable -> continue with next region
-                current = current.next.as_mut().unwrap();
-            }
-        }
-
-        // no suitable region found
-        None
-    }
-
-    /// Returns the allocation start address on success.
-    fn alloc_from_region(region: &ListNode, size: usize, align: usize)
-        -> Result<usize, ()>
-    {
-        let alloc_start = align_up(region.start_addr(), align);
-        let alloc_end = alloc_start.checked_add(size).ok_or(())?;
-
-        if alloc_end > region.end_addr() {
-            // region too small
-            return Err(());
-        }
-
-        let excess_size = region.end_addr() - alloc_end;
-        if excess_size > 0 && excess_size < mem::size_of::<ListNode>() {
-            // rest of region too small to hold a ListNode (required because the
-            // allocation splits the region in a used and a free part)
-            return Err(());
-        }
-
-        // region suitable for allocation
-        Ok(alloc_start)
-    }
-    
-    /// Returns the adjusted size and alignment as a (size, align) tuple.
-    fn size_align(layout: Layout) -> (usize, usize) {
-        let layout = layout
-            .align_to(mem::align_of::<ListNode>())
-            .expect("adjusting alignment failed")
-            .pad_to_align();
-        let size = layout.size().max(mem::size_of::<ListNode>());
-        (size, layout.align())
-    }
-}
-
-// unsafe fn alloc(Test : &mut LinkedListAllocator, layout: Layout) -> *mut u8 {
-//         // perform layout adjustme
-
-//         let (size, align) = LinkedListAllocator::size_align(layout);
-
-//         if let Some((region, alloc_start)) = Test.find_region(size, align) {
-//             let alloc_end = alloc_start.checked_add(size).expect("overflow");
-
-//             hprintln!("{:X}", alloc_end);
-            
-            
-//             let excess_size = region.end_addr() - alloc_end;
-//             if excess_size > 0 {
-//                 unsafe {
-//                     Test.add_free_region(alloc_end, excess_size);
-//                 }
-//             }
-//             return alloc_start as *mut u8;
-//         } else {
-//             return ptr::null_mut();
-//         }
-//     }
-
-
-// unsafe fn dealloc(test : &mut LinkedListAllocator, ptr: *mut u8, layout: Layout) {
-//     // perform layout adjustments
-//     let (size, _) = LinkedListAllocator::size_align(layout);
-
-//     unsafe { test.add_free_region(ptr as usize, size) }
-// }
-
-
-unsafe impl GlobalAlloc for Locked<LinkedListAllocator> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // perform layout adjustme
-
-        let (size, align) = LinkedListAllocator::size_align(layout);
-        let mut allocator = self.lock();
-
-        if let Some((region, alloc_start)) = allocator.find_region(size, align) {
-            let alloc_end = alloc_start.checked_add(size).expect("overflow");
-
-        
-            let excess_size = region.end_addr() - alloc_end;
-            if excess_size > 0 {
-                unsafe {
-                    allocator.add_free_region(alloc_end, excess_size);
-                }
-            }
-            return alloc_start as *mut u8;
-        } else {
-            return ptr::null_mut();
-        }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // perform layout adjustments
-        let (size, _) = LinkedListAllocator::size_align(layout);
-
-        unsafe { self.lock().add_free_region(ptr as usize, size) }
-    }
-}
-
-extern crate alloc;
 #[global_allocator]
 static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::new());
 
-use alloc::{boxed::Box, vec::Vec};
+static mut SCHEDULER: MaybeUninit<Scheduler> = MaybeUninit::uninit();
 
-
-struct Nigger {
-
-
-    name : usize,
-    priority : usize
-}
-
-extern "C" {
+extern "C" 
+{
     static mut _heap_start: u8;
     static mut _heap_end:   u8;
 }
 
 
-#[entry]
-fn main() -> ! {
+fn task1(arg : *mut usize) -> !
+{
+    // hprintln!("Entering task1 function");
+    let test_va : u128 = 12423123;
+    loop {
 
-    let mut test : LinkedListAllocator = LinkedListAllocator::new();
+    }
+}
+
+fn task2(arg : *mut usize) -> !
+{
+     let test_va : u128 = 12423123;
+    // hprintln!("Entering task2 function");
+    //  let scheduler =  unsafe {&mut *SCHEDULER.as_mut_ptr()};
+    // for thread in scheduler.threads.iter_mut() 
+    // {
+    //     hprintln!("Thread id: {}, stack pointer: {:p}", thread.id, thread.sp);
+    // }
+
+    loop {
+
+    }
+}
+
+
+fn task3(arg : *mut usize) -> !
+{
+     let test_va : u128 = 12423123;
+    // hprintln!("Entering task3 function");
+    //  let scheduler =  unsafe {&mut *SCHEDULER.as_mut_ptr()};
+    // for thread in scheduler.threads.iter_mut() 
+    // {
+    //     hprintln!("Thread id: {}, stack pointer: {:p}", thread.id, thread.sp);
+    // }
+
+    loop {
+
+    }
+}
+
+type TaskFn = fn(arg: *mut usize) -> !;
+
+fn task_exit_error() -> ! {
     
+    hprintln!("Task exited\n");
+
+    loop {
+        // panic, halt, or delete task
+    }
+}
 
 
+
+fn start_first_task() -> () {
+    let stack_ptr : *mut u32;
     unsafe {
+        let scheduler =  &mut *SCHEDULER.as_mut_ptr();
+        let current_thread = scheduler.threads.pop_front();
 
-    ALLOCATOR.lock().init(&raw mut _heap_start as *mut u8 as usize, 4096);
-
+        if (current_thread.is_none())
+        {
+            return;
+        }
+        scheduler.current_thread = current_thread;
+        stack_ptr = scheduler.current_thread.as_mut().unwrap().sp;
     }
 
-    hprintln!("{:p}", &raw mut _heap_start as *mut u8);
+    
+    unsafe {
+        asm!(
+        "msr psp, r0",
+        "movs r0, #2",
+        "msr control, r0",
+        "isb",
+        "pop   {{r4-r11}}",
+        "pop   {{r0-r3,r12,lr}}",   // force function entry
+        "pop   {{pc}}",             // 'jump' to the task entry function we put on the stack
+        in("r0") stack_ptr as u32,
+        options(noreturn),
+        )
+    }
+}
+
+
+fn task_init(entry : TaskFn)
+{
+    unsafe {
+        let layout = Layout::from_size_align(1024, size_of::<usize>()).expect("Invalid layout");;  
+        let stack_ptr = ALLOCATOR.alloc(layout) as *mut usize;
+        let mut highest_ptr = stack_ptr.offset(64);
+        let mut stack_offset = mem::size_of::<StackFrame>() / mem::size_of::<usize>();
+
+        // Top of the stack
+        // xpsr
+        //
+        // ...
+        // r0
+        // r11
+        // R4
+        // Bottom of the stack
+
+        let mut stack_frame2: &mut StackFrame = mem::transmute(&mut *highest_ptr.offset(-(stack_offset as isize)));
+        // let mut r3_r12 = highest_ptr.offset(-(stack_offset as isize));
+        stack_frame2.xpsr = 0x01000000;
+        stack_frame2.lr = 0xFFFFFFFD;
+        stack_frame2.pc = entry as u32;
+        stack_frame2.r0 = 0;
+        stack_frame2.r1 = 0;
+        stack_frame2.r3 = 0;
+        stack_frame2.r2 = 0;
+        stack_frame2.r12 = 0;
+
+        stack_offset += mem::size_of::<StackFrameExtension>() / mem::size_of::<usize>();
+        let sp = highest_ptr.offset(-(stack_offset as isize)) as *mut u32;
+
+        let scheduler =  &mut *SCHEDULER.as_mut_ptr();
+        scheduler.id_counter += 1;
+        scheduler.threads.push_back(Tcb::new(sp, scheduler.id_counter, 1));
+    }
+}
+
+#[entry]
+fn main() -> ! 
+{    
+    let mut peripheral = unsafe { cortex_m::Peripherals::steal() };
+    peripheral.SYST.set_reload(200_000_000 - 1);
+    peripheral.SYST.clear_current();
+    peripheral.SYST.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
+    peripheral.SYST.enable_interrupt();
+    peripheral.SYST.enable_counter();
 
     unsafe {
-        test.init(&raw mut _heap_start as *mut u8 as usize, 4096);
+        SCHEDULER = MaybeUninit::new(Scheduler::new());
+        peripheral
+            .SCB
+            .set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 0xFF);
     }
 
+
     unsafe {
 
-        // hprintln!("{}", mem::size_of::<Nigger>());
-        let layout = Layout::from_size_align_unchecked(mem::size_of::<Nigger>(), mem::size_of::<usize>());
+        ALLOCATOR.lock().init(&raw mut _heap_start as *mut u8 as usize, 4096);
 
-        let b = Box::new(49);
+
+        hprintln!("Task 1 pointer: {:p}", task2 as *mut u32);
+
+        task_init(task1);
+        task_init(task2);
+        task_init(task3);
+
+        // let tc = threads.pop_front();
+
+        // if (tc.is_none())
+        // {
+
+        // }
+
+        // let tc=  tc.unwrap();
+
+        hprintln!("Returned to main somehow idfk.");
+
+        start_first_task();
+        // High memory
+        // stackframe for r4 to r11 lives  
+        // 
+        //
+        // stackframe for r0 to r3  and psxr, pc, lr, etc...
+        // Low memory <--- our stack ptr points to atm
 
         // 
-
-        
+            
     }
-
     
-    svc_call(SysCall::ALLOC, 1, 1, 1);
-    // unsafe {
-    //     ALLOCATOR.lock().init(0x20000000 as usize, 0x4096 as usize);
-    // }
-    unsafe {
+    // cortex_m::peripheral::SCB::set_pendsv();
 
-        let layout = Layout::from_size_align_unchecked(mem::size_of::<TaskContext>(), mem::size_of::<usize>());
+    // cortex_m::peripheral::SYST::set_reload(&mut self, value);
 
-        let context = TaskContext {
-                r4:  0,
-                r5:  0,
-                r6:  0,
-                r7:  0,
-                r8:  0,
-                r9:  0,
-                r10: 0,
-                r11: 0,
-
-                // Hardware-saved (exception entry)
-                r0:   0,
-                r1:   0,
-                r2:   0,
-                r3:   0,
-                r12:  0,
-                lr:   32,
-                pc:   0,
-                xpsr: 0,
-        };
-
-        
-
-        let test = alloc(layout) as *mut TaskContext;
-
-        ptr::write(test, context);
-        // (*pxCurrentTCB).top_of_stack = test as *mut u32;
-        
-    }
-
-    // hprintln!("{}", 1);
-    // drop(b);
-    
-    // let mut v = Vec::new();
-   
-    // v.push(2);
-    hprintln!("HEllow");
-
-    cortex_m::peripheral::SCB::set_pendsv();
-    
     debug::exit(debug::EXIT_SUCCESS);
 
     loop {
         // your code goes here
     }
-}
-
-
-pub enum SysCall {
-    ALLOC,
-    FREE,
-}
-
-#[inline(always)]
-pub fn svc_call(service: SysCall, arg0: usize, arg1: usize, arg2: usize) -> usize {
-    hprintln!("S");
-    let ret: usize;
-    unsafe {
-        asm!(
-            "svc 0",
-            in("r0") service as usize,
-            in("r1") arg0,
-            in("r2") arg1,
-            in("r3") arg2,
-            lateout("r0") ret,        
-            options(nostack),
-        );
-    }
-    ret
-}
-
-
-
-#[no_mangle]
-#[unsafe(naked)]
-unsafe extern "C" fn SVCall() {
-    naked_asm!(
-        "push {{lr}}",
-        "bl syscall_handler",
-        "mov r4, r0", 
-        "pop {{lr}}",
-        "bx lr",
-    );
-}
-
-#[allow(unused_variables)]
-#[no_mangle]
-pub extern "Rust" fn syscall_handler(
-    service: SysCall,
-    arg0: usize,
-    arg1: usize,
-    arg2: usize,
-) {
-
-    match service {
-        SysCall::ALLOC => {
-            hprintln!("ALLOC");
-            
-        },
-        SysCall::FREE => {
-            hprintln!("FREE");
-        }
-    }
-    hprintln!("{}, {}, {}", arg0, arg1, arg2);
-}
-
-
-#[no_mangle]
-pub unsafe extern "C" fn vTaskSwitchContext() {
-    hprintln!("FUC");
-    dump_current_task_registers();
-}
-
-
-
-
-
-pub unsafe fn dump_current_task_registers() {
-    let tcb = pxCurrentTCB;
-    if tcb.is_null() {
-
-        hprintln!("NULL");
-        return;
-    }
-   hprintln!("NOT NULL");
-    // r4 is at top_of_stack
-    let ctx = (*tcb).top_of_stack as *const TaskContext;
-    let ctx = &*ctx;
-
-    hprintln!("===== TASK REGISTER DUMP =====");
-    hprintln!("r0  = 0x{:08x}", ctx.r0);
-    hprintln!("r1  = 0x{:08x}", ctx.r1);
-    hprintln!("r2  = 0x{:08x}", ctx.r2);
-    hprintln!("r3  = 0x{:08x}", ctx.r3);
-    hprintln!("r4  = 0x{:08x}", ctx.r4);
-    hprintln!("r5  = 0x{:08x}", ctx.r5);
-    hprintln!("r6  = 0x{:08x}", ctx.r6);
-    hprintln!("r7  = 0x{:08x}", ctx.r7);
-    hprintln!("r8  = 0x{:08x}", ctx.r8);
-    hprintln!("r9  = 0x{:08x}", ctx.r9);
-    hprintln!("r10 = 0x{:08x}", ctx.r10);
-    hprintln!("r11 = 0x{:08x}", ctx.r11);
-    hprintln!("r12 = 0x{:08x}", ctx.r12);
-    hprintln!("lr  = 0x{:08x}", ctx.lr);
-    hprintln!("pc  = 0x{:08x}", ctx.pc);
-    hprintln!("xPSR= 0x{:08x}", ctx.xpsr);
-}
-
-#[no_mangle]
-#[unsafe(naked)]
-pub unsafe extern "C" fn PendSV() {
-
-    // hprintln!("FACU");
-
-    naked_asm!(
-        // r0 = PSP (current task's stack pointer)
-        "mrs r0, psp",
-        "isb",
-
-        // r3 = &pxCurrentTCB
-        "ldr r3, ={pxCurrentTCB}",
-        // r2 = pxCurrentTCB (pointer to current TCB)
-        "ldr r2, [r3]",
-
-        // Save r4–r11 onto current task's stack (PSP)
-        "stmdb r0!, {{r4-r11}}",
-        // Store updated PSP into TCB->top_of_stack
-        "str r0, [r2]",
-
-        // Save kernel working registers (r3 = &pxCurrentTCB, r14 = EXC_RETURN) on MSP
-        "stmdb sp!, {{r3, r14}}",
-
-        // Ensure BASEPRI = 0 (enable interrupts for scheduler if you use BASEPRI)
-        "mov r0, #0",
-        "msr basepri, r0",
-
-        // Call C/Rust scheduler: updates pxCurrentTCB to next ready task
-        "bl {vTaskSwitchContext}",
-
-        // Again ensure BASEPRI = 0 after scheduler
-        "mov r0, #0",
-        "msr basepri, r0",
-
-        // Restore r3 (&pxCurrentTCB) and r14 (EXC_RETURN) from MSP
-        "ldmia sp!, {{r3, r14}}",
-
-        // r1 = pxCurrentTCB (new current TCB)
-        "ldr r1, [r3]",
-        // r0 = new TCB->top_of_stack (saved PSP)
-        "ldr r0, [r1]",
-
-        // Restore r4–r11 from new task's stack
-        "ldmia r0!, {{r4-r11}}",
-        // Write PSP = new task stack pointer
-        "msr psp, r0",
-        "isb",
-
-        // Exception return: hardware will pop r0–r3, r12, pc, lr, xPSR
-        "bx r14",
-
-        pxCurrentTCB = sym pxCurrentTCB,
-        vTaskSwitchContext = sym vTaskSwitchContext
-    );
 }
