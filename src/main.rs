@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+pub mod kernel;
 use panic_halt as _; 
 extern crate alloc;
 use cortex_m_rt::entry;
@@ -10,31 +11,14 @@ use core::mem;
 use core::arch::{naked_asm, asm};
 use cortex_m_rt::exception;
 use core::mem::MaybeUninit;
-
-
-pub mod kernel;
 use kernel::scheduler::Scheduler;
 use kernel::allocator::LinkedListAllocator;
 use kernel::allocator::Locked;
-use kernel::thread::Tcb;
+use kernel::thread::{Tcb, TaskFn};
 use kernel::thread::{StackFrameExtension, StackFrame};
-
-#[repr(C)]
-pub struct Stack {
-    /// Pointer to the lowest address of the stack
-    bottom: *mut u8,
-    /// Stack size
-    size: usize,
-    /// Current stack pointer
-    ptr: *mut usize,
-}
-
-
-
 
 #[global_allocator]
 static ALLOCATOR: Locked<LinkedListAllocator> = Locked::new(LinkedListAllocator::new());
-
 static mut SCHEDULER: MaybeUninit<Scheduler> = MaybeUninit::uninit();
 
 extern "C" 
@@ -42,7 +26,6 @@ extern "C"
     static mut _heap_start: u8;
     static mut _heap_end:   u8;
 }
-
 
 fn task1(arg : *mut usize) -> !
 {
@@ -68,7 +51,6 @@ fn task2(arg : *mut usize) -> !
     }
 }
 
-
 fn task3(arg : *mut usize) -> !
 {
      let test_va : u128 = 12423123;
@@ -84,8 +66,6 @@ fn task3(arg : *mut usize) -> !
     }
 }
 
-type TaskFn = fn(arg: *mut usize) -> !;
-
 fn task_exit_error() -> ! {
     
     hprintln!("Task exited\n");
@@ -94,8 +74,6 @@ fn task_exit_error() -> ! {
         // panic, halt, or delete task
     }
 }
-
-
 
 fn start_first_task() -> () {
     let stack_ptr : *mut u32;
@@ -111,7 +89,6 @@ fn start_first_task() -> () {
         stack_ptr = scheduler.current_thread.as_mut().unwrap().sp;
     }
 
-    
     unsafe {
         asm!(
         "msr psp, r0",
@@ -126,7 +103,6 @@ fn start_first_task() -> () {
         )
     }
 }
-
 
 fn task_init(entry : TaskFn)
 {
@@ -168,6 +144,8 @@ fn task_init(entry : TaskFn)
 #[entry]
 fn main() -> ! 
 {    
+
+    // Initialise sys tick timer
     let mut peripheral = unsafe { cortex_m::Peripherals::steal() };
     peripheral.SYST.set_reload(200_000_000 - 1);
     peripheral.SYST.clear_current();
@@ -180,41 +158,16 @@ fn main() -> !
         peripheral
             .SCB
             .set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 0xFF);
-    }
-
-
-    unsafe {
 
         ALLOCATOR.lock().init(&raw mut _heap_start as *mut u8 as usize, 4096);
-
-
-        hprintln!("Task 1 pointer: {:p}", task2 as *mut u32);
 
         task_init(task1);
         task_init(task2);
         task_init(task3);
 
-        // let tc = threads.pop_front();
-
-        // if (tc.is_none())
-        // {
-
-        // }
-
-        // let tc=  tc.unwrap();
-
         hprintln!("Returned to main somehow idfk.");
 
         start_first_task();
-        // High memory
-        // stackframe for r4 to r11 lives  
-        // 
-        //
-        // stackframe for r0 to r3  and psxr, pc, lr, etc...
-        // Low memory <--- our stack ptr points to atm
-
-        // 
-            
     }
     
     // cortex_m::peripheral::SCB::set_pendsv();
@@ -224,6 +177,5 @@ fn main() -> !
     debug::exit(debug::EXIT_SUCCESS);
 
     loop {
-        // your code goes here
     }
 }

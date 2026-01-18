@@ -1,3 +1,8 @@
+# Rust based RTOS:
+
+Currently has preemptive context switching with round robin scheduling (time slices).
+Has custom memory allocator using list based memory allocation.
+
 # `cortex-m-quickstart`
 
 > A template for building applications for ARM Cortex-M microcontrollers

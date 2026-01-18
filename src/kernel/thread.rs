@@ -5,6 +5,8 @@ pub enum State {
 
 }
 
+pub type TaskFn = fn(arg: *mut usize) -> !;
+
 #[repr(C)]
 // #[derive(Debug, Default, Clone, Copy)]
 pub struct Tcb {
